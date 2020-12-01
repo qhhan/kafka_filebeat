@@ -18,7 +18,6 @@
 package kafka
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,18 +26,15 @@ import (
 
 	"github.com/Shopify/sarama"
 
-	"github.com/elastic/beats/v7/libbeat/common/fmtstr"
-	"github.com/elastic/beats/v7/libbeat/common/transport"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/outputs"
-	"github.com/elastic/beats/v7/libbeat/outputs/codec"
-	"github.com/elastic/beats/v7/libbeat/outputs/outil"
-	"github.com/elastic/beats/v7/libbeat/publisher"
-	"github.com/elastic/beats/v7/libbeat/testing"
+	"github.com/elastic/beats/libbeat/common/fmtstr"
+	"github.com/elastic/beats/libbeat/logp"
+	"github.com/elastic/beats/libbeat/outputs"
+	"github.com/elastic/beats/libbeat/outputs/codec"
+	"github.com/elastic/beats/libbeat/outputs/outil"
+	"github.com/elastic/beats/libbeat/publisher"
 )
 
 type client struct {
-	log      *logp.Logger
 	observer outputs.Observer
 	hosts    []string
 	topic    outil.Selector
@@ -46,7 +42,6 @@ type client struct {
 	index    string
 	codec    codec.Codec
 	config   sarama.Config
-	mux      sync.Mutex
 
 	producer sarama.AsyncProducer
 
@@ -77,12 +72,11 @@ func newKafkaClient(
 	cfg *sarama.Config,
 ) (*client, error) {
 	c := &client{
-		log:      logp.NewLogger(logSelector),
 		observer: observer,
 		hosts:    hosts,
 		topic:    topic,
 		key:      key,
-		index:    strings.ToLower(index),
+		index:    index,
 		codec:    writer,
 		config:   *cfg,
 	}
@@ -90,15 +84,12 @@ func newKafkaClient(
 }
 
 func (c *client) Connect() error {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-
-	c.log.Debugf("connect: %v", c.hosts)
+	debugf("connect: %v", c.hosts)
 
 	// try to connect
 	producer, err := sarama.NewAsyncProducer(c.hosts, &c.config)
 	if err != nil {
-		c.log.Errorf("Kafka connect fails with: %+v", err)
+		logp.Err("Kafka connect fails with: %v", err)
 		return err
 	}
 
@@ -112,14 +103,7 @@ func (c *client) Connect() error {
 }
 
 func (c *client) Close() error {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-	c.log.Debug("closed kafka client")
-
-	// producer was not created before the close() was called.
-	if c.producer == nil {
-		return nil
-	}
+	debugf("closed kafka client")
 
 	c.producer.AsyncClose()
 	c.wg.Wait()
@@ -127,7 +111,7 @@ func (c *client) Close() error {
 	return nil
 }
 
-func (c *client) Publish(_ context.Context, batch publisher.Batch) error {
+func (c *client) Publish(batch publisher.Batch) error {
 	events := batch.Events()
 	c.observer.NewBatch(len(events))
 
@@ -144,7 +128,7 @@ func (c *client) Publish(_ context.Context, batch publisher.Batch) error {
 		d := &events[i]
 		msg, err := c.getEventMessage(d)
 		if err != nil {
-			c.log.Errorf("Dropping event: %+v", err)
+			logp.Err("Dropping event: %v", err)
 			ref.done()
 			c.observer.Dropped(1)
 			continue
@@ -165,27 +149,19 @@ func (c *client) String() string {
 func (c *client) getEventMessage(data *publisher.Event) (*message, error) {
 	event := &data.Content
 	msg := &message{partition: -1, data: *data}
-
-	value, err := data.Cache.GetValue("partition")
-	if err == nil {
-		if c.log.IsDebug() {
-			c.log.Debugf("got event.Meta[\"partition\"] = %v", value)
+	if event.Meta != nil {
+		if value, ok := event.Meta["partition"]; ok {
+			if partition, ok := value.(int32); ok {
+				msg.partition = partition
+			}
 		}
-		if partition, ok := value.(int32); ok {
-			msg.partition = partition
+
+		if value, ok := event.Meta["topic"]; ok {
+			if topic, ok := value.(string); ok {
+				msg.topic = topic
+			}
 		}
 	}
-
-	value, err = data.Cache.GetValue("topic")
-	if err == nil {
-		if c.log.IsDebug() {
-			c.log.Debugf("got event.Meta[\"topic\"] = %v", value)
-		}
-		if topic, ok := value.(string); ok {
-			msg.topic = topic
-		}
-	}
-
 	if msg.topic == "" {
 		topic, err := c.topic.Select(event)
 		if err != nil {
@@ -195,16 +171,14 @@ func (c *client) getEventMessage(data *publisher.Event) (*message, error) {
 			return nil, errNoTopicsSelected
 		}
 		msg.topic = topic
-		if _, err := data.Cache.Put("topic", topic); err != nil {
-			return nil, fmt.Errorf("setting kafka topic in publisher event failed: %v", err)
+		if event.Meta == nil {
+			event.Meta = map[string]interface{}{}
 		}
+		event.Meta["topic"] = topic
 	}
 
 	serializedEvent, err := c.codec.Encode(c.index, event)
 	if err != nil {
-		if c.log.IsDebug() {
-			c.log.Debugf("failed event: %v", event)
-		}
 		return nil, err
 	}
 
@@ -228,27 +202,26 @@ func (c *client) getEventMessage(data *publisher.Event) (*message, error) {
 
 func (c *client) successWorker(ch <-chan *sarama.ProducerMessage) {
 	defer c.wg.Done()
-	defer c.log.Debug("Stop kafka ack worker")
+	defer debugf("Stop kafka ack worker")
 
 	for libMsg := range ch {
 		msg := libMsg.Metadata.(*message)
-		msg.ref.log(msg)
 		msg.ref.done()
 	}
 }
 
+func (r *msgRef) log(msg *message) {
+	logp.Info("kafka (topic=%v),partition=%v,offset=%v",msg.topic,msg.partition,msg.hash)
+}
+
 func (c *client) errorWorker(ch <-chan *sarama.ProducerError) {
 	defer c.wg.Done()
-	defer c.log.Debug("Stop kafka error handler")
+	defer debugf("Stop kafka error handler")
 
 	for errMsg := range ch {
 		msg := errMsg.Msg.Metadata.(*message)
 		msg.ref.fail(msg, errMsg.Err)
 	}
-}
-
-func (r *msgRef) log(msg *message) {
-	r.client.log.Info("topic=%v,partition=%v,hash=%v",msg.topic,msg.partition,msg.hash)
 }
 
 func (r *msgRef) done() {
@@ -258,14 +231,12 @@ func (r *msgRef) done() {
 func (r *msgRef) fail(msg *message, err error) {
 	switch err {
 	case sarama.ErrInvalidMessage:
-		r.client.log.Errorf("Kafka (topic=%v): dropping invalid message", msg.topic)
-		r.client.observer.Dropped(1)
+		logp.Err("Kafka (topic=%v): dropping invalid message", msg.topic)
 
 	case sarama.ErrMessageSizeTooLarge, sarama.ErrInvalidMessageSize:
-		r.client.log.Errorf("Kafka (topic=%v): dropping too large message of size %v.",
+		logp.Err("Kafka (topic=%v): dropping too large message of size %v.",
 			msg.topic,
 			len(msg.key)+len(msg.value))
-		r.client.observer.Dropped(1)
 
 	default:
 		r.failed = append(r.failed, msg.data)
@@ -280,7 +251,7 @@ func (r *msgRef) dec() {
 		return
 	}
 
-	r.client.log.Debug("finished kafka batch")
+	debugf("finished kafka batch")
 	stats := r.client.observer
 
 	err := r.err
@@ -294,24 +265,9 @@ func (r *msgRef) dec() {
 			stats.Acked(success)
 		}
 
-		r.client.log.Debugf("Kafka publish failed with: %+v", err)
+		debugf("Kafka publish failed with: %v", err)
 	} else {
 		r.batch.ACK()
 		stats.Acked(r.total)
 	}
-}
-
-func (c *client) Test(d testing.Driver) {
-	if c.config.Net.TLS.Enable == true {
-		d.Warn("TLS", "Kafka output doesn't support TLS testing")
-	}
-
-	for _, host := range c.hosts {
-		d.Run("Kafka: "+host, func(d testing.Driver) {
-			netDialer := transport.TestNetDialer(d, c.config.Net.DialTimeout)
-			_, err := netDialer.Dial("tcp", host)
-			d.Error("dial up", err)
-		})
-	}
-
 }

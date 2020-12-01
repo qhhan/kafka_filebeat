@@ -22,7 +22,7 @@ import (
 
 	"github.com/Shopify/sarama"
 
-	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/beats/libbeat/publisher"
 )
 
 type message struct {
@@ -33,6 +33,7 @@ type message struct {
 	value []byte
 	ref   *msgRef
 	ts    time.Time
+
 	hash      uint32
 	partition int32
 

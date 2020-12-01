@@ -20,7 +20,6 @@
 package kafka
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -33,14 +32,14 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/fmtstr"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/outputs"
-	_ "github.com/elastic/beats/v7/libbeat/outputs/codec/format"
-	_ "github.com/elastic/beats/v7/libbeat/outputs/codec/json"
-	"github.com/elastic/beats/v7/libbeat/outputs/outest"
+	"github.com/elastic/beats/libbeat/beat"
+	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/common/fmtstr"
+	"github.com/elastic/beats/libbeat/logp"
+	"github.com/elastic/beats/libbeat/outputs"
+	_ "github.com/elastic/beats/libbeat/outputs/codec/format"
+	_ "github.com/elastic/beats/libbeat/outputs/codec/json"
+	"github.com/elastic/beats/libbeat/outputs/outest"
 )
 
 const (
@@ -200,7 +199,7 @@ func TestKafkaPublish(t *testing.T) {
 		}
 
 		t.Run(name, func(t *testing.T) {
-			grp, err := makeKafka(nil, beat.Info{Beat: "libbeat", IndexPrefix: "testbeat"}, outputs.NewNilObserver(), cfg)
+			grp, err := makeKafka(beat.Info{Beat: "libbeat"}, outputs.NewNilObserver(), cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -209,7 +208,6 @@ func TestKafkaPublish(t *testing.T) {
 			if err := output.Connect(); err != nil {
 				t.Fatal(err)
 			}
-			assert.Equal(t, output.index, "testbeat")
 			defer output.Close()
 
 			// publish test events
@@ -221,7 +219,7 @@ func TestKafkaPublish(t *testing.T) {
 				}
 
 				wg.Add(1)
-				output.Publish(context.Background(), batch)
+				output.Publish(batch)
 			}
 
 			// wait for all published batches to be ACKed
@@ -244,63 +242,33 @@ func TestKafkaPublish(t *testing.T) {
 				validate = makeValidateFmtStr(fmt.(string))
 			}
 
-			seenMsgs := map[string]struct{}{}
-			for _, s := range stored {
-				msg := validate(t, s.Value, expected)
-				seenMsgs[msg] = struct{}{}
+			for i, d := range expected {
+				validate(t, stored[i].Value, d)
 			}
-			assert.Equal(t, len(expected), len(seenMsgs))
 		})
 	}
 }
 
-func validateJSON(t *testing.T, value []byte, events []beat.Event) string {
+func validateJSON(t *testing.T, value []byte, event beat.Event) {
 	var decoded map[string]interface{}
 	err := json.Unmarshal(value, &decoded)
 	if err != nil {
 		t.Errorf("can not json decode event value: %v", value)
-		return ""
+		return
 	}
-
-	msg := decoded["message"].(string)
-	event := findEvent(events, msg)
-	if event == nil {
-		t.Errorf("could not find expected event with message: %v", msg)
-		return ""
-	}
-
 	assert.Equal(t, decoded["type"], event.Fields["type"])
-
-	return msg
+	assert.Equal(t, decoded["message"], event.Fields["message"])
 }
 
-func makeValidateFmtStr(fmt string) func(*testing.T, []byte, []beat.Event) string {
+func makeValidateFmtStr(fmt string) func(*testing.T, []byte, beat.Event) {
 	fmtString := fmtstr.MustCompileEvent(fmt)
-	return func(t *testing.T, value []byte, events []beat.Event) string {
-		msg := string(value)
-		event := findEvent(events, msg)
-		if event == nil {
-			t.Errorf("could not find expected event with message: %v", msg)
-			return ""
-		}
-
-		_, err := fmtString.Run(event)
+	return func(t *testing.T, value []byte, event beat.Event) {
+		expectedMessage, err := fmtString.Run(&event)
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		return msg
+		assert.Equal(t, string(expectedMessage), string(value))
 	}
-}
-
-func findEvent(events []beat.Event, msg string) *beat.Event {
-	for _, e := range events {
-		if e.Fields["message"] == msg {
-			return &e
-		}
-	}
-
-	return nil
 }
 
 func strDefault(a, defaults string) string {
@@ -338,49 +306,7 @@ func newTestConsumer(t *testing.T) sarama.Consumer {
 	return consumer
 }
 
-// topicOffsetMap is threadsafe map from topic => partition => offset
-type topicOffsetMap struct {
-	m  map[string]map[int32]int64
-	mu sync.RWMutex
-}
-
-func (m *topicOffsetMap) GetOffset(topic string, partition int32) int64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if m.m == nil {
-		return sarama.OffsetOldest
-	}
-
-	topicMap, ok := m.m[topic]
-	if !ok {
-		return sarama.OffsetOldest
-	}
-
-	offset, ok := topicMap[partition]
-	if !ok {
-		return sarama.OffsetOldest
-	}
-
-	return offset
-}
-
-func (m *topicOffsetMap) SetOffset(topic string, partition int32, offset int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.m == nil {
-		m.m = map[string]map[int32]int64{}
-	}
-
-	if _, ok := m.m[topic]; !ok {
-		m.m[topic] = map[int32]int64{}
-	}
-
-	m.m[topic][partition] = offset
-}
-
-var testTopicOffsets = topicOffsetMap{}
+var testTopicOffsets = map[string]int64{}
 
 func testReadFromKafkaTopic(
 	t *testing.T, topic string, nMessages int,
@@ -391,52 +317,31 @@ func testReadFromKafkaTopic(
 		consumer.Close()
 	}()
 
-	partitions, err := consumer.Partitions(topic)
+	offset, found := testTopicOffsets[topic]
+	if !found {
+		offset = sarama.OffsetOldest
+	}
+
+	partitionConsumer, err := consumer.ConsumePartition(topic, 0, offset)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		partitionConsumer.Close()
+	}()
 
-	done := make(chan struct{})
-	msgs := make(chan *sarama.ConsumerMessage)
-	for _, partition := range partitions {
-		offset := testTopicOffsets.GetOffset(topic, partition)
-		partitionConsumer, err := consumer.ConsumePartition(topic, partition, offset)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			partitionConsumer.Close()
-		}()
-
-		go func(p int32, pc sarama.PartitionConsumer) {
-			for {
-				select {
-				case msg, ok := <-pc.Messages():
-					if !ok {
-						break
-					}
-					testTopicOffsets.SetOffset(topic, p, msg.Offset+1)
-					msgs <- msg
-				case <-done:
-					break
-				}
-			}
-		}(partition, partitionConsumer)
-	}
-
-	var messages []*sarama.ConsumerMessage
 	timer := time.After(timeout)
-
-	for len(messages) < nMessages {
+	var messages []*sarama.ConsumerMessage
+	for i := 0; i < nMessages; i++ {
 		select {
-		case msg := <-msgs:
+		case msg := <-partitionConsumer.Messages():
 			messages = append(messages, msg)
+			testTopicOffsets[topic] = msg.Offset + 1
 		case <-timer:
 			break
 		}
 	}
 
-	close(done)
 	return messages
 }
 

@@ -28,10 +28,9 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/beats/libbeat/beat"
+	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/publisher"
 )
 
 type partTestScenario func(*testing.T, bool, sarama.Partitioner) error
@@ -197,7 +196,7 @@ func TestPartitioners(t *testing.T) {
 			continue
 		}
 
-		constr, err := makePartitioner(logp.L(), pcfg.Partition)
+		constr, err := makePartitioner(pcfg.Partition)
 		if err != nil {
 			t.Error(err)
 			continue

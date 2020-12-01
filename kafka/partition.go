@@ -28,11 +28,11 @@ import (
 
 	"github.com/Shopify/sarama"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/logp"
 )
 
-type partitionBuilder func(*logp.Logger, *common.Config) (func() partitioner, error)
+type partitionBuilder func(*common.Config) (func() partitioner, error)
 
 type partitioner func(*message, int32) (int32, error)
 
@@ -45,10 +45,9 @@ type messagePartitioner struct {
 }
 
 func makePartitioner(
-	log *logp.Logger,
 	partition map[string]*common.Config,
 ) (sarama.PartitionerConstructor, error) {
-	mkStrategy, reachable, err := initPartitionStrategy(log, partition)
+	mkStrategy, reachable, err := initPartitionStrategy(partition)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +67,6 @@ var partitioners = map[string]partitionBuilder{
 }
 
 func initPartitionStrategy(
-	log *logp.Logger,
 	partition map[string]*common.Config,
 ) (func() partitioner, bool, error) {
 	if len(partition) == 0 {
@@ -92,7 +90,7 @@ func initPartitionStrategy(
 	if mk == nil {
 		return nil, false, fmt.Errorf("unknown kafka partition mode %v", name)
 	}
-	constr, err := mk(log, config)
+	constr, err := mk(config)
 	if err != nil {
 		return nil, false, err
 	}
@@ -129,16 +127,16 @@ func (p *messagePartitioner) Partition(
 	}
 
 	msg.partition = partition
-
-	if _, err := msg.data.Cache.Put("partition", partition); err != nil {
-		return 0, fmt.Errorf("setting kafka partition in publisher event failed: %v", err)
+	event := &msg.data.Content
+	if event.Meta == nil {
+		event.Meta = map[string]interface{}{}
 	}
-
+	event.Meta["partition"] = partition
 	p.partitions = numPartitions
 	return msg.partition, nil
 }
 
-func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgRandomPartitioner(config *common.Config) (func() partitioner, error) {
 	cfg := struct {
 		GroupEvents int `config:"group_events" validate:"min=1"`
 	}{
@@ -165,7 +163,7 @@ func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partiti
 	}, nil
 }
 
-func cfgRoundRobinPartitioner(_ *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgRoundRobinPartitioner(config *common.Config) (func() partitioner, error) {
 	cfg := struct {
 		GroupEvents int `config:"group_events" validate:"min=1"`
 	}{
@@ -193,7 +191,7 @@ func cfgRoundRobinPartitioner(_ *logp.Logger, config *common.Config) (func() par
 	}, nil
 }
 
-func cfgHashPartitioner(log *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgHashPartitioner(config *common.Config) (func() partitioner, error) {
 	cfg := struct {
 		Hash   []string `config:"hash"`
 		Random bool     `config:"random"`
@@ -209,7 +207,7 @@ func cfgHashPartitioner(log *logp.Logger, config *common.Config) (func() partiti
 	}
 
 	return func() partitioner {
-		return makeFieldsHashPartitioner(log, cfg.Hash, !cfg.Random)
+		return makeFieldsHashPartitioner(cfg.Hash, !cfg.Random)
 	}, nil
 }
 
@@ -237,7 +235,7 @@ func makeHashPartitioner() partitioner {
 	}
 }
 
-func makeFieldsHashPartitioner(log *logp.Logger, fields []string, dropFail bool) partitioner {
+func makeFieldsHashPartitioner(fields []string, dropFail bool) partitioner {
 	generator := rand.New(rand.NewSource(rand.Int63()))
 	hasher := fnv.New32a()
 
@@ -256,7 +254,7 @@ func makeFieldsHashPartitioner(log *logp.Logger, fields []string, dropFail bool)
 
 			if err != nil {
 				if dropFail {
-					log.Errorf("Hashing partition key failed: %+v", err)
+					logp.Err("Hashing partition key failed: %v", err)
 					return -1, err
 				}
 

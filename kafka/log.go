@@ -20,12 +20,10 @@ package kafka
 import (
 	"github.com/Shopify/sarama"
 
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/libbeat/logp"
 )
 
-type kafkaLogger struct {
-	log *logp.Logger
-}
+type kafkaLogger struct{}
 
 func (kl kafkaLogger) Print(v ...interface{}) {
 	kl.Log("kafka message: %v", v...)
@@ -39,7 +37,7 @@ func (kl kafkaLogger) Println(v ...interface{}) {
 	kl.Log("kafka message: %v", v...)
 }
 
-func (kl kafkaLogger) Log(format string, v ...interface{}) {
+func (kafkaLogger) Log(format string, v ...interface{}) {
 	warn := false
 	for _, val := range v {
 		if err, ok := val.(sarama.KError); ok {
@@ -49,12 +47,9 @@ func (kl kafkaLogger) Log(format string, v ...interface{}) {
 			}
 		}
 	}
-	if kl.log == nil {
-		kl.log = logp.NewLogger(logSelector)
-	}
 	if warn {
-		kl.log.Warnf(format, v...)
+		logp.Warn(format, v...)
 	} else {
-		kl.log.Infof(format, v...)
+		logp.Info(format, v...)
 	}
 }
